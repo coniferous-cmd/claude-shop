@@ -1,0 +1,117 @@
+name: Mirror Claude Code Binaries
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOWNLOAD_BASE_URL: https://downloads.claude.ai/claude-code-releases
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest version
+        id: version
+        run: |
+          VERSION="$(curl -fsSL "$DOWNLOAD_BASE_URL/latest")"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Got invalid version from upstream: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected latest version: $VERSION"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download manifest and binaries
+        if: steps.check.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          curl -fsSL "$DOWNLOAD_BASE_URL/$VERSION/manifest.json" -o artifacts/manifest.json
+
+          # Iterate every platform in the manifest and download the binary.
+          # jq emits: <platform>\t<binary>\t<checksum>\t<size>
+          jq -r '.platforms | to_entries[] | "\(.key)\t\(.value.binary)\t\(.value.checksum)\t\(.value.size)"' artifacts/manifest.json | \
+          while IFS=$'\t' read -r platform bin checksum size; do
+            ext=""
+            if [[ "$bin" == *.exe ]]; then ext=".exe"; fi
+            out="artifacts/claude-${VERSION}-${platform}${ext}"
+
+            echo "::group::Downloading $platform ($bin, $((size/1024/1024)) MB)"
+            curl -fsSL "$DOWNLOAD_BASE_URL/$VERSION/$platform/$bin" -o "$out"
+            echo "::endgroup::"
+
+            actual="$(sha256sum "$out" | cut -d' ' -f1)"
+            if [ "$actual" != "$checksum" ]; then
+              echo "::error::Checksum mismatch for $platform: expected $checksum, got $actual"
+              exit 1
+            fi
+            echo "OK  $platform  $checksum"
+          done
+
+      - name: Build SHA256SUMS
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          cd artifacts
+          sha256sum claude-* manifest.json | sort -k2 > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Build release notes
+        if: steps.check.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          build_date="$(jq -r '.buildDate' artifacts/manifest.json)"
+          commit="$(jq -r '.commit' artifacts/manifest.json)"
+          {
+            echo "## Claude Code ${VERSION}"
+            echo
+            echo "- **Upstream version:** \`${VERSION}\`"
+            echo "- **Build date:** \`${build_date}\`"
+            echo "- **Upstream commit:** \`${commit}\`"
+            echo
+            echo "### Mirrored platforms"
+            echo
+            echo "| Platform | Binary | Size (MB) | SHA256 |"
+            echo "|----------|--------|-----------|--------|"
+            jq -r '.platforms | to_entries[] | "| `\(.key)` | `\(.value.binary)` | \((.value.size/1024/1024|floor)) | `\(.value.checksum[0:12])` |"' artifacts/manifest.json
+            echo
+            echo "### manifest.json"
+            echo
+            echo '```json'
+            cat artifacts/manifest.json
+            echo '```'
+          } > release-notes.md
+
+      - name: Create release
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Claude Code ${{ steps.version.outputs.version }}" \
+            --notes-file release-notes.md \
+            artifacts/claude-* artifacts/manifest.json artifacts/SHA256SUMS
