@@ -28,7 +28,7 @@ any new ones Anthropic adds):
 
 ## Release assets
 
-A release tag follows the upstream version, e.g. upstream `2.1.206` → tag `v2.1.206`.
+A release tag matches the upstream version, e.g. upstream `2.1.206` → tag `2.1.206`.
 
 Assets in each release:
 
@@ -48,7 +48,7 @@ manifest before upload — a mismatch fails the run and no release is created.
 
 ## Idempotency
 
-Before downloading, the workflow checks if a `v<version>` release already exists.
+Before downloading, the workflow checks if a `<version>` release already exists.
 If it does, the run exits early. So the daily cron is a no-op when upstream hasn't
 shipped a new version.
 
